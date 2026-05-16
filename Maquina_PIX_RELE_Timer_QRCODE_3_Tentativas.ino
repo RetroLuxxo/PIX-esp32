@@ -56,6 +56,7 @@ String redesDisponiveis = "";
 // --- PORTAS ---
 #define RELAY_PIN 13
 #define BUTTON_PIN 12
+#define BOOT_PIN 0   // Botão BOOT da placa
 #define LED_PIN 2
 #define TFT_CS 5
 #define TFT_DC 17
@@ -1079,6 +1080,7 @@ void setup() {
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, HIGH);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(BOOT_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
@@ -1097,17 +1099,47 @@ void setup() {
         unsigned long startTime = millis();
         exibirMensagem("CONFIGURAR   (5s)", ST77XX_YELLOW); 
 
-        while (digitalRead(BUTTON_PIN) == LOW && millis() - startTime < 5000) {  
-            int progress = map(millis() - startTime, 0, 5000, 0, 100);
-            tft.setCursor(10, 85);
-            tft.setTextColor(ST77XX_CYAN);
-            tft.print("Segure para Config   ");
-            tft.print(String(progress) + "%");
-            tft.print(" ");  
+        while (digitalRead(BUTTON_PIN) == LOW && millis() - startTime < 25000) {  
+            unsigned long el = millis() - startTime;
+            if (el < 5000) {
+                int progress = map(el, 0, 5000, 0, 100);
+                tft.setCursor(10, 85);
+                tft.setTextColor(ST77XX_CYAN);
+                tft.print("Config: ");
+                tft.print(String(progress) + "%  ");
+            } else {
+                int progress = map(el, 5000, 25000, 0, 100);
+                tft.fillScreen(ST77XX_RED);
+                tft.setCursor(5, 40);
+                tft.setTextColor(ST77XX_WHITE);
+                tft.setTextSize(2);
+                tft.println("SOLTE PARA");
+                tft.println("RESETAR!");
+                tft.setCursor(5, 100);
+                tft.setTextSize(1);
+                tft.print("Reset: ");
+                tft.print(String(progress) + "%");
+            }
             delay(50);
         }
         
-        if (millis() - startTime >= 5000) {
+        unsigned long elapsed = millis() - startTime;
+        if (elapsed >= 25000) {
+            // 25 segundos = RESET TOTAL
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 60);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("RESETANDO");
+            tft.println("TUDO...");
+            if (SPIFFS.exists("/config.json")) {
+                SPIFFS.remove("/config.json");
+            }
+            delay(2000);
+            ESP.restart();
+            return;
+        } else if (elapsed >= 5000) {
+            // 5 segundos = modo AP
             carregarConfig(); 
             entrarModoConfigAP();
             return; 
@@ -1130,7 +1162,51 @@ void loop() {
     }
     
     processarComandoSerial();
-    
+
+    // BOOT + BUTTON juntos por 3s = RESET TOTAL
+    static unsigned long btnHoldStart = 0;
+    static int ultimoPct = -1;
+    if (digitalRead(BUTTON_PIN) == LOW && digitalRead(BOOT_PIN) == LOW) {
+        if (btnHoldStart == 0) { btnHoldStart = millis(); ultimoPct = -1; }
+        unsigned long held = millis() - btnHoldStart;
+        int pct = min((int)map(held, 0, 3000, 0, 100), 100);
+        if (pct != ultimoPct) {
+            ultimoPct = pct;
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 40);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("SOLTE PARA");
+            tft.println("RESETAR!");
+            tft.setCursor(5, 100);
+            tft.setTextSize(1);
+            tft.print("Reset: ");
+            tft.print(String(pct) + "%");
+        }
+        if (held >= 3000) {
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 60);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("RESETANDO");
+            tft.println("TUDO...");
+            delay(2000);
+            if (SPIFFS.exists("/config.json")) SPIFFS.remove("/config.json");
+            ESP.restart();
+        }
+    } else {
+        if (btnHoldStart != 0) {
+            btnHoldStart = 0;
+            if (estadoAtual == EM_ESPERA) exibirTelaInicial();
+        }
+    }
+
+    // Se BOOT pressionado, bloqueia qualquer ação
+    if (digitalRead(BOOT_PIN) == LOW) {
+        delay(10);
+        return;
+    }
+
     static unsigned long lastCheckTime = 0;
     const long checkInterval = 5000;
     unsigned long currentTime = millis();
