@@ -1,0 +1,1217 @@
+/*
+ * Projeto: Máquina de Vendas Autônoma com PIX (RELÉ)
+ * Versão: 6.0.5 - SOMA Valor, Liberação Múltipla (NO TROCO/CRÉDITO) - Timeout de 10s - Somente CRÉDITO
+ * Correção 6.0.3: Verificação de pagamento ocorre ANTES do timeout do QR Code.
+ * Correção 6.0.4: Cancelamento manual verifica pagamento antes de cancelar —
+ *                 se o PIX já foi pago, libera o produto em vez de cancelar.
+ * Correção 6.0.5: Cancelamento manual agora invalida a cobrança no Mercado Pago via API,
+ *                 impedindo pagamento após o cancelamento (evita produto não liberado).
+ * Correção 6.0.6: Implementação de um timer no canto inferior direito do QrCode.
+ * Correção 6.0.7: Realiza 3 tentativas de Conexão e vai automaticamente para o modo AP p/ Configurar.
+ */
+// --- BIBLIOTECAS ---
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h> 
+#include <ArduinoJson.h>
+#include <SPIFFS.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <WebServer.h> 
+#include "unoqrcode.h" 
+
+#include "pag_ok.h"
+#include "trsc_concluid.h"
+#include "Tela_inicial_MP.h"
+//#include "Tela_inicial_AG.h"
+
+// --- CONFIGURAÇÃO SERIAL ESTÁVEL ---
+#define DEBUG_SERIAL true
+
+#if DEBUG_SERIAL
+  #define DBG_LOG(x) do { \
+    Serial.println(x); \
+    Serial.flush(); \
+    delay(2); \
+  } while(0)
+  
+  #define DBG_LOG_FAST(x) Serial.println(x)
+#else
+  #define DBG_LOG(x)
+  #define DBG_LOG_FAST(x)
+#endif
+// --- FIM CORREÇÃO SERIAL ---
+
+// --- CONFIGURAÇÕES DO ACCESS POINT (AP) ---
+const char* ap_ssid = "MAQUINA_PIX_CONFIG";
+const char* ap_password = "senha_temporaria";
+IPAddress local_ip(192, 168, 4, 1);
+IPAddress gateway(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WebServer server(80);
+
+// --- PORTAS ---
+#define RELAY_PIN 13
+#define BUTTON_PIN 12
+#define LED_PIN 2
+#define TFT_CS 5
+#define TFT_DC 17
+#define TFT_RST 16
+
+// --- VARIÁVEIS GLOBAIS ---
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+//TESTE CRONOMETRO ABAIXO DO QR CODE - RICK ---
+unsigned long tempoInicial;
+const unsigned long duracaoSegundos = 178; // 3 minutos
+int ultimoSegundoRegistrado = -1;
+// ---
+
+//TESTE: 3 TENTATIVAS DE CONEXÃO WI-FI, CASO NAO CONECTE, ENTRA NO MODO AP PARA RECONFIGURAR --- RICK ---
+const int maxTentativas = 3;
+int tentativas = 0;
+
+// ---
+
+// Estado da Máquina
+enum MachineState {
+  EM_ESPERA, 
+  CONTANDO_PRODUTOS, 
+  GERANDO_PIX, 
+  AGUARDANDO_PAGAMENTO, 
+  LIBERANDO_PRODUTO, 
+  MODO_AP_CONFIG
+};
+MachineState estadoAtual = EM_ESPERA;
+
+// --- ESTRUTURA DE CONFIGURAÇÃO ---
+struct Config {
+  char wifiSsid[32];
+  char wifiPassword[32];
+  char mpAccessToken[128];
+  char mpExternalPosId[40];
+  char storeName[64];       // Nome da Loja
+  float valorProduto;       // Valor Unitário (Base para o pulso/soma)
+  int tempoReleMs;          // Tempo de Pulso
+};
+Config configMaquina;
+
+// Variáveis para a transação PIX
+String paymentId = "";
+String pixPayload = "";
+float valorAcumulado = 0.00f;   // Valor total a ser pago na transação PIX atual
+float valorPagoPix = 0.00f;     // Valor REALMENTE pago na última transação
+
+unsigned long lastButtonPressTime = 0;
+unsigned long lastInteractionTime = 0;
+unsigned long pixStartTime = 0;
+
+// Constantes de tempo
+const long DEBOUNCE_DELAY = 100; 
+const long INACTIVITY_TIMEOUT = 10000; // 10 segundos para iniciar o PIX
+const long QR_TIMEOUT_MS = 180000;     // 3 minutos para pagar
+
+// --- QR CODE ---
+#define QR_VERSION 11
+#define QR_ECC_LEVEL 2
+
+QRCode qrcode; 
+uint8_t qrcodeData[800];
+
+// Parâmetros de Desenho
+const int QR_SCALE = 2;
+const int START_X = 3;
+const int START_Y = 15;
+const int COLOR_BLACK = ST77XX_BLACK;
+const int COLOR_WHITE = ST77XX_WHITE;
+
+// ===================================
+// --- PROTÓTIPOS DE FUNÇÕES ---
+// ===================================
+void entrarModoConfigAP();
+void handleRoot();
+void handleSave();
+void salvarConfig();
+void carregarConfig();
+
+void exibirTelaInicial();
+void exibirMensagem(const char* mensagem, int corTexto = ST77XX_WHITE);
+void exibirTelaContagem();
+void exibirTelaPagamentoRecebido();
+void exibirTelaProdutoLiberado();
+
+void conectarWiFi();
+void drawQRCode(int x, int y, int scale, float valorExibido);
+
+String criarCobrancaPixMercadoPago(float valor);
+float verificarValorPagoMercadoPago(String id);
+bool cancelarCobrancaMercadoPago(String id);
+
+// ===================================
+// --- FUNÇÕES DE CONFIGURAÇÃO VIA AP ---
+// ===================================
+
+void entrarModoConfigAP() {
+    estadoAtual = MODO_AP_CONFIG;
+    DBG_LOG("📡 MODO CONFIGURAÇÃO AP: Inicializando Access Point...");
+    
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+
+    tft.fillScreen(ST77XX_BLUE);
+    tft.setCursor(5, 15);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(2);
+    tft.println("CONFIG AP:");
+    tft.drawFastHLine(0, 40, tft.width(), ST77XX_WHITE);
+    tft.setCursor(5, 80);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(1);
+    tft.println(ap_ssid);
+    tft.setCursor(5, 120);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.println("Acesse 192.168.4.1");
+    
+    WiFi.softAPConfig(local_ip, gateway, subnet);
+    WiFi.softAP(ap_ssid, ap_password);
+    
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.onNotFound(handleRoot); 
+
+    server.begin();
+}
+
+void handleRoot() {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Configura&ccedil;&atilde;o M&aacute;quina PIX</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f7f6; color: #494949; margin: 0; padding: 20px; }
+        .container { max-width: 450px; margin: 0 auto; background: #1E1E1E; padding: 25px; border-radius: 12px; 
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #00D1FF; text-align: center; margin-bottom: 25px; }
+        form label { display: block; margin: 10px 0 5px; font-weight: 600; color: #00D1FF; }
+        form input[type="text"], form input[type="password"], form input[type="number"] {
+            color: #ffffff; background-color: #2D2D2D; width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #00D1FF; border-radius: 6px; box-sizing: border-box; 
+            transition: border-color 0.3s;
+        }
+        form input:focus { border-color: #007bff; outline: none; }
+        form button {
+            width: 100%; padding: 12px; background-color: #007BFF; color: white; border: none; 
+            border-radius: 6px; cursor: pointer; font-size: 1em; font-weight: bold;
+            transition: background-color 0.3s;
+        }
+        form button:hover { background-color: #055cad; }
+        .section-title { color: #ffffff; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 20px; margin-bottom: 15px; font-size: 1.2em; font-weight: bold }
+    
+        .input-group {
+    position: relative;
+    width: 100%;
+    margin-bottom: 15px;
+	}
+
+	.input-group input {
+    width: 100%;
+    padding: 12px;
+    padding-right: 45px; /* Espaço para o ícone */
+    background-color: #2D2D2D;
+    color: white;
+    border: 1px solid #444;
+    border-radius: 8px;
+    box-sizing: border-box;
+	}
+
+	.toggle-password {
+    position: absolute;
+    right: 15px;
+    top: 55%;
+    transform: translateY(-50%);
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.7;
+	}
+
+	.toggle-password:hover {
+    opacity: 1;
+	}
+
+    </style>
+	</head>
+	<body>
+	<body style="background-color: #121212;">
+    <div class='container'>
+        <h1>⚙️ Configura&ccedil;&atilde;o M&aacute;quina PIX</h1>
+        <form action='/save' method='POST'>
+            <div class="section-title">Dados de Conex&atilde;o Wi-Fi</div>
+            <label for='ssid'>SSID da Rede:</label>
+            <input type='text' id='ssid' name='ssid' value='%ssid%' required maxlength='31'>
+
+            <div class="input-group">
+            <label for='password'>Senha da Rede:</label>
+             <input type='password' id='password' name='password' value='%password%' required maxlength='31'>
+            <!-- Ícone de Olho (usando um caractere simples ou SVG) -->
+            <span class="toggle-password" onclick="toggleVisibility('password')">👁️</span>
+            </div>
+            
+            <!-- Área Protegida -->
+            <div id="area-secreta" style="display:none; border: 3px solid #00D1FF; padding: 10px; margin-bottom: 10px;">
+
+            <div class="section-title">Credenciais Mercado Pago</div>
+            <label for='token'>🔒 Access Token MP (Bearer): 🔒</label>
+            <input type='text' id='token' name='token' value='%token%' required minlength='10' maxlength='127'>
+            
+            </div>			
+			
+			<!-- Controle de Acesso -->
+			<div id="controle-senha">
+			<button type="button" onclick="pedirSenha()">🔒 Insira o Access Token MP 🔒</button>
+			</div>            
+            
+            <label for='storeName'>Nome da Loja (Para Descri&ccedil;&atilde;o do PIX):</label>
+            <input type='text' id='storeName' name='storeName' value='%storeName%' required minlength='3' maxlength='63'>
+
+            <label for='posid'>ID de Identifica&ccedil;&atilde;o da M&aacute;quina (PosId):</label>
+            <input type='text' id='posid' name='posid' value='%posid%' placeholder='Ex: LOJA_CENTRO_MAQ01' required minlength='3' maxlength='39'>
+            
+            <div class="section-title">Configura&ccedil;&otilde;es do Produto e Acionamento</div>
+            <label for='valor'>Valor do Item UNIT&Aacute;RIO (R$):</label>
+            <input type='number' step='0.01' id='valor' name='valor' value='%valor%' required min='0.01'>
+            
+            <label for='tempoRele'>Tempo de Pulso do Rel&eacute; (ms):</label>
+            <input type='number' id='tempoRele' name='tempoRele' value='%tempoRele%' required min='100' max='5000'>
+            
+            <button type='submit'>💾 Salvar Configura&ccedil;&atilde;o e Reiniciar</button>
+        </form>
+    </div>
+
+    <script>
+    function toggleVisibility(id) {
+    const input = document.getElementById(id);
+    const icon = event.target;
+
+    if (input.type === "password") {
+        input.type = "text";
+        icon.textContent = "⛔"; // Muda o ícone para: Esconder 🙈
+    } else {
+        input.type = "password";
+        icon.textContent = "👁️"; // Volta ao ícone original
+    }
+	}
+    </script>
+	
+	<script>
+	function pedirSenha() {
+	const senhaCorreta = "12345678"; //
+	const senhaDigitada = prompt("Digite a senha de administrador:");
+
+	if (senhaDigitada === senhaCorreta) {
+    document.getElementById('area-secreta').style.display = 'block'; // Mostra a área
+    document.getElementById('controle-senha').style.display = 'none'; // Esconde o botão de liberar
+    alert("Acesso liberado!");
+	} else {
+    alert("Senha incorreta!");
+	}
+	}
+	</script>	
+	
+</body>
+</html>
+)rawliteral";
+
+    String s = html;
+    s.replace("%ssid%", configMaquina.wifiSsid);
+    s.replace("%password%", configMaquina.wifiPassword);
+    s.replace("%token%", configMaquina.mpAccessToken);
+    s.replace("%storeName%", configMaquina.storeName); 
+    s.replace("%posid%", configMaquina.mpExternalPosId);
+    s.replace("%valor%", String(configMaquina.valorProduto, 2));
+    s.replace("%tempoRele%", String(configMaquina.tempoReleMs));
+
+    server.send(200, "text/html", s);
+}
+
+void handleSave() {
+    DBG_LOG("🚨 Recebendo dados de configuração via Web AP...");
+    
+    if (server.hasArg("ssid") && server.hasArg("password") && server.hasArg("token") && 
+        server.hasArg("posid") && server.hasArg("valor") && server.hasArg("tempoRele") && 
+        server.hasArg("storeName")) {
+        
+        String ssid = server.arg("ssid");
+        ssid.toCharArray(configMaquina.wifiSsid, sizeof(configMaquina.wifiSsid));
+        
+        String pass = server.arg("password");
+        pass.toCharArray(configMaquina.wifiPassword, sizeof(configMaquina.wifiPassword));
+        
+        String token = server.arg("token");
+        token.toCharArray(configMaquina.mpAccessToken, sizeof(configMaquina.mpAccessToken));
+
+        String posid = server.arg("posid");
+        posid.toCharArray(configMaquina.mpExternalPosId, sizeof(configMaquina.mpExternalPosId));
+
+        String storeName = server.arg("storeName"); 
+        storeName.toCharArray(configMaquina.storeName, sizeof(configMaquina.storeName));
+
+        configMaquina.valorProduto = server.arg("valor").toFloat();
+        configMaquina.tempoReleMs = server.arg("tempoRele").toInt();
+        
+        // Validações
+        if (configMaquina.valorProduto < 0.01f) {
+           configMaquina.valorProduto = 1.00f; 
+        }
+        
+        if (configMaquina.tempoReleMs < 100 || configMaquina.tempoReleMs > 5000) {
+           configMaquina.tempoReleMs = 300;
+        }
+
+        if (String(configMaquina.mpAccessToken).length() < 10) {
+            DBG_LOG("❌ ERRO: Access Token do Mercado Pago muito curto. Configuração não salva.");
+            server.send(500, "text/plain", "ERRO: Access Token muito curto. Tente novamente.");
+            return;
+        }
+
+        salvarConfig();
+        DBG_LOG("✅ CONFIGURAÇÃO RECEBIDA E SALVA! O sistema irá reiniciar em 5 segundos.");
+        
+        String response = "<h1>Configura&ccedil;&otilde;es Salvas!</h1><p>O sistema ir&aacute; reiniciar em instantes para aplicar as novas configura&ccedil;&otilde;es.</p>";
+        server.send(200, "text/html", response);
+        
+        delay(5000);
+        ESP.restart();
+
+    } else {
+        DBG_LOG("❌ Erro: Dados POST incompletos.");
+        server.send(400, "text/plain", "Erro: Dados incompletos no formulário.");
+    }
+}
+
+void salvarConfig() {
+    File arquivo = SPIFFS.open("/config.json", "w");
+    if (arquivo) {
+        StaticJsonDocument<1024> doc; 
+        doc["wifiSsid"] = configMaquina.wifiSsid;
+        doc["wifiPassword"] = configMaquina.wifiPassword;
+        doc["mpAccessToken"] = configMaquina.mpAccessToken;
+        doc["mpExternalPosId"] = configMaquina.mpExternalPosId;
+        doc["storeName"] = configMaquina.storeName; 
+        doc["valorProduto"] = configMaquina.valorProduto;
+        doc["tempoReleMs"] = configMaquina.tempoReleMs;
+        serializeJson(doc, arquivo);
+        arquivo.close();
+        DBG_LOG("✅ Configuração salva no SPIFFS!");
+    }
+}
+
+void carregarConfig() {
+    // Configuração padrão de fallback
+    strlcpy(configMaquina.wifiSsid, "", sizeof(configMaquina.wifiSsid));
+    strlcpy(configMaquina.wifiPassword, "", sizeof(configMaquina.wifiPassword));
+    strlcpy(configMaquina.mpAccessToken, "", sizeof(configMaquina.mpAccessToken));
+    strlcpy(configMaquina.mpExternalPosId, "MAQUINA01", sizeof(configMaquina.mpExternalPosId));
+    strlcpy(configMaquina.storeName, "MINHA LOJA", sizeof(configMaquina.storeName));
+    configMaquina.valorProduto = 1.00f; 
+    configMaquina.tempoReleMs = 300;
+    
+    if (SPIFFS.exists("/config.json")) {
+        File arquivo = SPIFFS.open("/config.json", "r");
+        if (arquivo) {
+            StaticJsonDocument<1024> doc;
+            DeserializationError error = deserializeJson(doc, arquivo);
+        
+            if (!error) {
+                strlcpy(configMaquina.wifiSsid, doc["wifiSsid"] | "", sizeof(configMaquina.wifiSsid));
+                strlcpy(configMaquina.wifiPassword, doc["wifiPassword"] | "", sizeof(configMaquina.wifiPassword));
+                strlcpy(configMaquina.mpAccessToken, doc["mpAccessToken"] | "", sizeof(configMaquina.mpAccessToken));
+                strlcpy(configMaquina.mpExternalPosId, doc["mpExternalPosId"] | "MAQUINA01", sizeof(configMaquina.mpExternalPosId));
+                strlcpy(configMaquina.storeName, doc["storeName"] | "MINHA LOJA", sizeof(configMaquina.storeName)); 
+                configMaquina.valorProduto = doc["valorProduto"] | 1.00f;
+                configMaquina.tempoReleMs = doc["tempoReleMs"] | 300;
+                DBG_LOG("✅ Configuração carregada do SPIFFS");
+            } else {
+                DBG_LOG("❌ Erro ao ler JSON de configuração: " + String(error.c_str()));
+            }
+            arquivo.close();
+        }
+    }
+}
+
+// ===================================
+// --- FUNÇÕES SERIAL (OPERAÇÃO) ---
+// ===================================
+
+void processarComandoSerial() {
+    if (!Serial.available()) return;
+    
+    String comando = Serial.readStringUntil('\n');
+    comando.trim();
+    
+    while(Serial.available()) Serial.read(); 
+    
+    String comandoUpper = comando;
+    comandoUpper.toUpperCase();
+
+    // COMANDO: ZERAR CONFIGURAÇÃO
+    if (comandoUpper == "RESETWIFI") {
+        DBG_LOG("🚨 COMANDO MANUAL: ZERANDO TODAS as configurações.");
+        exibirMensagem(" ZERANDO   DADOS...", ST77XX_RED);
+        WiFi.disconnect(true);
+        if (SPIFFS.exists("/config.json")) {
+            SPIFFS.remove("/config.json");
+        }
+        DBG_LOG("🔄 Reiniciando em 3 segundos...");
+        delay(3000);
+        ESP.restart();
+        return; 
+    }
+    
+    // COMANDO: INICIAR VENDA/GERAR PIX (Simula um clique)
+    if (estadoAtual == EM_ESPERA) {
+        if (comandoUpper == "INICIAR" || comandoUpper == "GO") {
+            DBG_LOG("🚨 COMANDO MANUAL: Iniciando contagem de venda via Serial.");
+            valorAcumulado = configMaquina.valorProduto;
+            estadoAtual = CONTANDO_PRODUTOS;
+            exibirTelaContagem();
+            lastInteractionTime = millis();
+            return;
+        }
+    }
+    
+    // COMANDO: CONFIRMAR PAGAMENTO (Simula aprovação)
+    if (estadoAtual == AGUARDANDO_PAGAMENTO && (comandoUpper == "PAGO" || comandoUpper == "CONFIRMAR")) {
+        DBG_LOG("🚨 COMANDO MANUAL: Forçando verificação de pagamento (PAGO).");
+        
+        // Em um ambiente de teste, podemos simular o valor pago para o pagamento
+        // valorPagoPix = valorAcumulado; // Descomente para teste simples: paga o que foi pedido
+        
+        // Em produção, a linha abaixo deve ser usada para obter o valor real
+        valorPagoPix = verificarValorPagoMercadoPago(paymentId);
+        
+        if (valorPagoPix >= valorAcumulado) {
+            DBG_LOG("✅ Pagamento APROVADO via comando manual. Valor Pago: R$" + String(valorPagoPix, 2));
+            estadoAtual = LIBERANDO_PRODUTO; // <<< Transição Direta para a Liberação
+            exibirTelaPagamentoRecebido();
+        } else {
+            DBG_LOG("❌ Pagamento não detectado ou valor pago insuficiente. Cancelando venda.");
+            exibirMensagem("PAGAMENTO   FALHOU", ST77XX_RED);
+            delay(3000);
+            valorAcumulado = 0.00f;
+            estadoAtual = EM_ESPERA;
+            exibirTelaInicial();
+        }
+        return;
+    }
+
+    // COMANDO: IR PARA PIX
+    if (estadoAtual == CONTANDO_PRODUTOS && (comandoUpper == "PIX" || comandoUpper == "PAGAR")) {
+        DBG_LOG("🚨 COMANDO MANUAL: Forçando geração do PIX com valor R$" + String(valorAcumulado, 2));
+        estadoAtual = GERANDO_PIX;
+        exibirMensagem(" GERANDO   QR CODE!", ST77XX_YELLOW);
+        return;
+    }
+    
+    if (estadoAtual != MODO_AP_CONFIG && !comando.isEmpty() && !comandoUpper.startsWith("CREDIT=")) {
+        DBG_LOG("ℹ️ Comando Serial recebido (Nao reconhecido neste estado): " + comando);
+    }
+}
+
+// ===================================
+// --- FUNÇÕES DISPLAY ---
+// ===================================
+void exibirTelaInicial() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setRotation(0);
+    tft.drawRGBBitmap(0, 0, Tela_inicial, 128, 160);//CHAMA IMAGEM DA TELA INICIAL - RICK
+
+    tft.setCursor(5, 3); 
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(1);
+    tft.println(configMaquina.storeName);
+    
+    //COMENTEI AS LINHAS ABAIXO PARA TIRA-LAS DA TELA INICIAL - RICK
+    /*
+    tft.setCursor(10, 30); 
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(2);
+    tft.println("BEM-VINDO");
+    
+    tft.drawFastHLine(0, 55, tft.width(), ST77XX_WHITE); 
+    
+    tft.setCursor(5, 75); 
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextSize(1); 
+    tft.println("CLIQUE: ADICIONA");
+    tft.setCursor(5, 85);
+    tft.println("CREDITO"); // ALTERADO: Removido "PULSO/"
+    
+    tft.setCursor(5, 120);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setTextSize(1); 
+    tft.println("Valor UNIDADE:"); 
+
+    tft.setCursor(5, 135); 
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setTextSize(2); 
+    tft.print("R$ ");
+    tft.println(String(configMaquina.valorProduto, 2));
+    */
+
+    delay(100); 
+}
+
+void exibirTelaContagem() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setRotation(0);
+    
+    tft.setCursor(30, 10); 
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(2);
+    tft.println("TOTAL");
+    
+    tft.drawFastHLine(0, 35, tft.width(), ST77XX_WHITE); 
+    
+    tft.setCursor(5, 50); 
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextSize(1); 
+    tft.println("VALOR PIX:");
+
+    tft.setCursor(5, 70); 
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setTextSize(2); 
+    tft.print("R$ ");
+    tft.println(String(valorAcumulado, 2));
+    
+    tft.setCursor(5, 115); 
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(1); 
+    tft.println("PROXIMO CLIQUE: SOMA"); 
+    tft.setCursor(5, 130);
+    tft.println("R$ " + String(configMaquina.valorProduto, 2));
+    
+    tft.setCursor(5, 145); 
+    tft.setTextColor(ST77XX_WHITE);
+    tft.println("AGUARDE 10s para PIX");
+}
+
+void drawQRCode(int x, int y, int scale, float valorExibido) {
+    tft.fillScreen(COLOR_WHITE);
+
+    tft.setCursor(13, 2);
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(1);
+    tft.println("CLIQUE P CANCELAR");
+    
+    for (uint8_t qy = 0; qy < qrcode.size; qy++) {
+        for (uint8_t qx = 0; qx < qrcode.size; qx++) {
+            int block_x = x + qx * scale;
+            int block_y = y + qy * scale;
+            if (qrcode_getModule(&qrcode, qx, qy)) {
+                tft.fillRect(block_x, block_y, scale, scale, COLOR_BLACK);
+            } else {
+                tft.fillRect(block_x, block_y, scale, scale, COLOR_WHITE);
+            }
+            yield();
+        }
+    }
+    
+    int qr_end_y = y + qrcode.size * scale; 
+    
+    tft.setCursor(3, qr_end_y + 8);
+    tft.setTextColor(ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.print("R$");
+    tft.print(String(valorExibido, 2));
+    
+    tempoInicial = millis(); // --- TESTE CRONOMETRO ABAIXO DO QR CODE - RICK --- Inicia a contagem
+    }
+
+    //TESTE CRONOMETRO ABAIXO DO QR CODE - RICK ---
+    void atualizarTimer() {
+    unsigned long millisAtuais = millis();
+    unsigned long tempoPassado = (millisAtuais - tempoInicial) / 1000;
+
+    if (tempoPassado <= duracaoSegundos) {
+        int tempoRestante = duracaoSegundos - tempoPassado;
+        int minutos = tempoRestante / 60;
+        int segundos = tempoRestante % 60;
+
+        // Atualiza apenas se o segundo mudou
+        if (segundos != ultimoSegundoRegistrado) {
+            ultimoSegundoRegistrado = segundos;
+
+            // Apaga apenas a área do tempo (X=80, Y=140, Largura=45, Altura=10)
+            tft.fillRect(95, 151, 33, 9, ST77XX_BLACK);
+            tft.setCursor(97, 152);
+            tft.setTextColor(ST77XX_GREEN);
+            tft.setTextSize(1);
+            tft.printf("%02d:%02d", minutos, segundos);
+        }
+    } else {
+        // // Ação após os 3 minutos
+        // tft.fillScreen(ST77XX_BLACK);
+        // tft.setCursor(20, 80);
+        // tft.print("QR Code Expirado");
+    }
+    }
+    // ---
+
+
+void exibirMensagem(const char* mensagem, int corTexto) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setRotation(0);
+    
+    tft.setCursor(5, 40);//15, 40 - ALTERADO PARA 5, 40 - RICK
+    tft.setTextColor(corTexto);
+    tft.setTextSize(2);
+    tft.println(mensagem);
+
+    tft.setCursor(5, 100);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(1);
+    
+    delay(100); 
+}
+
+void exibirTelaPagamentoRecebido() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setRotation(0);
+    tft.drawRGBBitmap(0, 0, pag_ok, 128, 160);//CHAMA IMAGEM DO PAGAMENTO CONCLUIDO - RICK
+
+    /*
+    tft.setCursor(10, 20);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setTextSize(2);
+    tft.println("Pagamento");
+    tft.setCursor(10, 40);
+    tft.println("Recebido!");
+    
+    tft.setCursor(5, 100);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(1);
+    tft.println("Liberando creditos."); // ALTERADO: de 'pulsos' para 'créditos'
+    */
+    delay(2000); //Exibe a imagem PAGAMENTO CONCLUIDO por 2 Segundos
+}
+
+void exibirTelaProdutoLiberado() {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setRotation(0);
+    tft.drawRGBBitmap(0, 0, Credit_liberad, 128, 160);//CHAMA IMAGEM DO PAGAMENTO CONCLUIDO - RICK
+
+    /*
+    tft.setCursor(10, 30);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(2);
+    tft.println("CREDITOS");
+    tft.setCursor(10, 50);
+    tft.println("LIBERADOS");
+    
+    tft.drawFastHLine(0, 80, tft.width(), ST77XX_WHITE); 
+
+    tft.setCursor(5, 115); 
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(1); 
+    tft.println("Transacao Finalizada");
+
+    tft.setCursor(5, 135); 
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(1); 
+    tft.println("Volte a clicar para comprar.");
+    */
+
+    delay(2000);
+}
+
+
+// ===================================
+// --- FUNÇÕES PRINCIPAIS E MP ---
+// ===================================
+
+void conectarWiFi() {
+    if (String(configMaquina.wifiSsid).length() == 0 || String(configMaquina.mpAccessToken).length() < 10) {
+        DBG_LOG("❌ Configuração incompleta. Entrando no MODO CONFIG AP.");
+        entrarModoConfigAP();
+        return;
+    }
+    
+    DBG_LOG("📡 Tentando conectar a WiFi: " + String(configMaquina.wifiSsid));
+    //exibirMensagem("CONECTANDO  WI-FI...", ST77XX_YELLOW);
+    
+    WiFi.mode(WIFI_STA);  
+    WiFi.begin(configMaquina.wifiSsid, configMaquina.wifiPassword);
+    
+
+    while (WiFi.status() != WL_CONNECTED && tentativas < maxTentativas) {
+    tentativas++;
+    Serial.print("Tentativa ");
+    Serial.print(tentativas);
+    Serial.println(" de 3...");
+
+    exibirMensagem("CONECTANDO  WI-FI...", ST77XX_YELLOW);
+    //tft.fillScreen(ST77XX_BLACK);
+    tft.setCursor(10, 90);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(2);
+    tft.println(String(tentativas) + " de 3...");
+
+    WiFi.begin(configMaquina.wifiSsid, configMaquina.wifiPassword);
+    
+    // Aguarda até 15 segundos por tentativa
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
+    }
+    Serial.println("");
+  }
+
+  // Verificação final
+if (WiFi.status() == WL_CONNECTED) {
+        DBG_LOG("\n✅ WiFi Conectado! IP: " + WiFi.localIP().toString());
+        estadoAtual = EM_ESPERA;
+        exibirTelaInicial();
+    } else {
+        DBG_LOG("\n❌ Falha na conexão WiFi.");
+        tft.fillScreen(ST77XX_RED);
+        tft.setCursor(40, 25);
+        tft.setTextColor(ST77XX_WHITE);
+        tft.setTextSize(2);
+        tft.println("FORA");
+        tft.setCursor(52, 50);
+        tft.println("DE");
+        tft.setCursor(22, 75);
+        tft.println("SERVICO");
+        tft.drawFastHLine(0, 110, tft.width(), ST77XX_WHITE); // LINHA
+        tft.setCursor(12, 130);
+        tft.setTextSize(1);
+        tft.println("SEM CONEXAO WI-FI");
+
+        delay (3000);
+
+        entrarModoConfigAP();
+        // conectarWiFi();
+        //estadoAtual = EM_ESPERA;
+    }
+}
+   
+    
+
+const char* mp_host = "api.mercadopago.com";
+
+// Cancela uma cobrança PIX no Mercado Pago (status → cancelled)
+// Isso invalida o QR Code e impede pagamento após cancelamento manual.
+bool cancelarCobrancaMercadoPago(String id) {
+    if (id.isEmpty()) return false;
+
+    DBG_LOG("🚫 Cancelando cobrança PIX id=" + id + " no Mercado Pago...");
+
+    String url = "https://" + String(mp_host) + "/v1/payments/" + id;
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(configMaquina.mpAccessToken));
+
+    // A API do MP usa PUT com status=cancelled para cancelar
+    int httpCode = http.PUT("{\"status\":\"cancelled\"}");
+
+    bool sucesso = (httpCode == 200);
+    if (sucesso) {
+        DBG_LOG("✅ Cobrança cancelada com sucesso no Mercado Pago.");
+    } else {
+        DBG_LOG("⚠️ Falha ao cancelar cobrança (HTTP " + String(httpCode) + "). QR pode ainda estar ativo.");
+    }
+
+    http.end();
+    return sucesso;
+}
+
+String criarCobrancaPixMercadoPago(float valor) {
+    DBG_LOG("💳 Criando PIX via MP API para R$" + String(valor, 2));
+    
+    valorPagoPix = 0.00f; 
+    
+    if (String(configMaquina.mpAccessToken).length() < 10) {
+        exibirMensagem("  ERRO:    TOKEN MP", ST77XX_RED);
+        return "";
+    }
+    
+    String uniqueID = String(millis());
+    String externalReference = String(configMaquina.mpExternalPosId) + "-" + uniqueID;
+    
+    String url = "https://" + String(mp_host) + "/v1/payments";
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    
+    HTTPClient http;
+    http.begin(client, url);
+
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(configMaquina.mpAccessToken));
+    http.addHeader("X-Idempotency-Key", externalReference);
+    
+    StaticJsonDocument<1024> reqDoc;
+
+    reqDoc["transaction_amount"] = valor; 
+    
+    // USANDO O NOME DA LOJA NA DESCRIÇÃO
+    reqDoc["description"] = "Venda " + String(configMaquina.storeName) + " - ID: " + String(configMaquina.mpExternalPosId); 
+
+    reqDoc["payment_method_id"] = "pix";
+    reqDoc["installments"] = 1;
+    reqDoc["external_reference"] = externalReference; 
+    
+    JsonObject payer = reqDoc.createNestedObject("payer");
+    payer["email"] = "pix@maquinavenda.com";
+    payer["first_name"] = configMaquina.mpExternalPosId;
+    payer["last_name"] = "VENDING";
+    
+    String requestBody;
+    serializeJson(reqDoc, requestBody);
+    
+    int httpResponseCode = http.POST(requestBody);
+
+    if (httpResponseCode > 0) {
+        String payload = http.getString();
+        if (httpResponseCode == 201) { 
+            StaticJsonDocument<1024> respDoc;
+            DeserializationError error = deserializeJson(respDoc, payload);
+
+            if (!error) {
+                paymentId = respDoc["id"].as<String>();
+                String qrCodePayload = respDoc["point_of_interaction"]["transaction_data"]["qr_code"].as<String>();
+                
+                http.end();
+                if (!qrCodePayload.isEmpty()) {
+                    return qrCodePayload;
+                }
+            } 
+        } 
+    }
+    
+    http.end();
+    return "";
+}
+
+float verificarValorPagoMercadoPago(String id) {
+    if (id.isEmpty()) return 0.00f;
+    
+    String url = "https://" + String(mp_host) + "/v1/payments/" + id;
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    HTTPClient http;
+    http.begin(client, url);
+
+    http.addHeader("Authorization", "Bearer " + String(configMaquina.mpAccessToken));
+
+    int httpResponseCode = http.GET();
+    float paidAmount = 0.00f;  
+
+    if (httpResponseCode == 200) {  
+        String payload = http.getString();
+        StaticJsonDocument<1024> doc; 
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (!error) {
+            String status = doc["status"].as<String>();
+
+            if (status == "approved") {
+                paidAmount = doc["transaction_amount"] | 0.00f; 
+            }
+        } 
+    } 
+    
+    http.end();
+    
+    return paidAmount;
+}
+
+// ===================================
+// --- SETUP E LOOP ---
+// ===================================
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setTimeout(50);
+    
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+
+    tft.initR(INITR_BLACKTAB); 
+    tft.setRotation(0);
+    tft.fillScreen(ST77XX_BLACK);
+    
+    if (!SPIFFS.begin(true)) {
+        DBG_LOG("❌ Erro SPIFFS.");
+        return;
+    }
+    
+    // CHECAGEM DE BOTÃO NA INICIALIZAÇÃO (MODO CONFIG AP)
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        unsigned long startTime = millis();
+        exibirMensagem("CONFIGURAR   (5s)", ST77XX_YELLOW); 
+
+        while (digitalRead(BUTTON_PIN) == LOW && millis() - startTime < 5000) {  
+            int progress = map(millis() - startTime, 0, 5000, 0, 100);
+            tft.setCursor(10, 85);
+            tft.setTextColor(ST77XX_CYAN);
+            tft.print("Segure para Config   ");
+            tft.print(String(progress) + "%");
+            tft.print(" ");  
+            delay(50);
+        }
+        
+        if (millis() - startTime >= 5000) {
+            carregarConfig(); 
+            entrarModoConfigAP();
+            return; 
+        } else {
+            exibirMensagem("INICIANDO!", ST77XX_WHITE);
+        }
+    }
+
+    carregarConfig();
+    conectarWiFi();
+}
+
+void loop() {
+
+    
+    if (estadoAtual == MODO_AP_CONFIG) {
+        server.handleClient();
+        delay(10);
+        return;
+    }
+    
+    processarComandoSerial();
+    
+    static unsigned long lastCheckTime = 0;
+    const long checkInterval = 5000;
+    unsigned long currentTime = millis();
+    
+    // Lógica do Botão: Iniciar Compra ou Somar Valor
+    if (digitalRead(BUTTON_PIN) == LOW && (currentTime - lastButtonPressTime) > DEBOUNCE_DELAY) {
+        delay(DEBOUNCE_DELAY);
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            
+            if (estadoAtual == EM_ESPERA) {
+                // Inicia nova transação
+                valorAcumulado = configMaquina.valorProduto;
+                DBG_LOG("🚨 Botão: Início de compra. Custo inicial: R$" + String(valorAcumulado, 2));
+                estadoAtual = CONTANDO_PRODUTOS;
+            
+            } else if (estadoAtual == CONTANDO_PRODUTOS) {
+                // SOMA O VALOR FIXO
+                valorAcumulado += configMaquina.valorProduto; 
+                DBG_LOG("🚨 Botão: Somou valor. Novo PIX de R$" + String(valorAcumulado, 2));
+            
+            } else if (estadoAtual == AGUARDANDO_PAGAMENTO) {
+                // CANCELAMENTO MANUAL — verifica pagamento antes de cancelar
+                // Cenario: cliente A escaneou e pagou, cliente B apertou cancelar ao mesmo tempo.
+                DBG_LOG("\u26a0\ufe0f Bot\u00e3o: Tentativa de cancelamento. Verificando se ja houve pagamento...");
+                exibirMensagem("VERIFICAND ...", ST77XX_YELLOW);
+
+                float valorVerificado = verificarValorPagoMercadoPago(paymentId);
+
+                if (valorVerificado >= valorAcumulado) {
+                    // Pagamento ja foi confirmado - libera o produto, nao cancela
+                    DBG_LOG("\u2705 Pagamento detectado no cancelamento! Valor: R$" + String(valorVerificado, 2) + " - Liberando produto.");
+                    valorPagoPix = valorVerificado;
+                    estadoAtual = LIBERANDO_PRODUTO;
+                    exibirTelaPagamentoRecebido();
+                } else {
+                    // Nao ha pagamento - cancela a cobrança no MP e volta ao início
+                    DBG_LOG("\u274c Sem pagamento. Cancelando cobrança no Mercado Pago...");
+                    exibirMensagem("CANCELANDO ...", ST77XX_YELLOW);
+                    cancelarCobrancaMercadoPago(paymentId); // Invalida o QR Code no servidor
+                    paymentId = "";
+                    pixPayload = "";
+                    exibirMensagem("  VENDA    CANCELADA", ST77XX_YELLOW);
+                    delay(2000);
+                    valorAcumulado = 0.00f;
+                    estadoAtual = EM_ESPERA;
+                    exibirTelaInicial();
+                }
+                
+            }
+            
+            lastButtonPressTime = currentTime;
+            lastInteractionTime = currentTime;
+            
+            if (estadoAtual == CONTANDO_PRODUTOS) {
+                exibirTelaContagem();
+            }
+        }
+    }
+
+// 
+    while (digitalRead(BUTTON_PIN) == LOW) { 
+    delay(10); 
+  }
+
+
+    // Máquina de estados principal
+    switch (estadoAtual) {
+        
+        case EM_ESPERA:
+            if (currentTime % 1000 < 500) {
+                digitalWrite(LED_PIN, HIGH);
+            } else {
+                digitalWrite(LED_PIN, LOW);
+            }
+            break;
+
+        case CONTANDO_PRODUTOS: {
+            // Lógica de Timeout (Vai para GERANDO_PIX)
+            if ((currentTime - lastInteractionTime) >= INACTIVITY_TIMEOUT) {
+                DBG_LOG("⏰ Timeout de inatividade (" + String(INACTIVITY_TIMEOUT/1000) + "s). Gerando PIX para R$" + String(valorAcumulado, 2));
+                estadoAtual = GERANDO_PIX;
+                exibirMensagem(" GERANDO   QR CODE!", ST77XX_YELLOW);
+            }
+            digitalWrite(LED_PIN, LOW);
+            break;
+        }
+
+        case GERANDO_PIX:
+            pixPayload = criarCobrancaPixMercadoPago(valorAcumulado);
+            
+            if (!pixPayload.isEmpty()) {
+                qrcode_initText(&qrcode, qrcodeData, QR_VERSION, QR_ECC_LEVEL, pixPayload.c_str());
+                drawQRCode(START_X, START_Y, QR_SCALE, valorAcumulado);                
+                pixStartTime = currentTime; // Inicia o timer
+                lastCheckTime = currentTime; // Inicia a primeira checagem
+                estadoAtual = AGUARDANDO_PAGAMENTO;
+                digitalWrite(LED_PIN, LOW);
+            } else {
+                DBG_LOG("❌ Falha ao gerar PIX. Voltando para EM_ESPERA.");
+                exibirMensagem("  ERRO      PIX...", ST77XX_RED);
+                delay(2000);
+                valorAcumulado = 0.00f;
+                estadoAtual = EM_ESPERA;
+                exibirTelaInicial();
+            }
+            break;
+
+        case AGUARDANDO_PAGAMENTO:
+
+        atualizarTimer(); //TESTE CRONOMETRO ABAIXO DO QR CODE - RICK ---
+
+            // 1. PRIMEIRO: Verificação de Pagamento (a cada 5s)
+            // Garante que mesmo no último instante antes do timeout,
+            // um pagamento aprovado seja sempre processado.
+            if ((currentTime - lastCheckTime) >= checkInterval) {
+                lastCheckTime = currentTime;
+                valorPagoPix = verificarValorPagoMercadoPago(paymentId);
+                
+                if (valorPagoPix >= valorAcumulado) {
+                    DBG_LOG("✅ Pagamento APROVADO! Valor Pago: R$" + String(valorPagoPix, 2));
+                    
+                    // TRANSICAO AUTOMATICA
+                    estadoAtual = LIBERANDO_PRODUTO;
+                    exibirTelaPagamentoRecebido();
+                    break; // Sai imediatamente — não verifica timeout
+                } else if (valorPagoPix > 0.00f && valorPagoPix < valorAcumulado) {
+                    DBG_LOG("❌ Pagamento INSUFICIENTE. Cancelando.");
+                    exibirMensagem("PAGAMENTO INSUFIC...", ST77XX_RED);
+                    delay(3000);
+                    valorAcumulado = 0.00f;
+                    estadoAtual = EM_ESPERA;
+                    exibirTelaInicial();
+                    break;
+                } else {
+                    DBG_LOG_FAST("🔄 Aguardando pagamento...");
+                }
+            }
+
+            // 2. DEPOIS: Lógica de Timeout do QR
+            // Só cancela se o pagamento não foi confirmado acima.
+            if ((currentTime - pixStartTime) >= QR_TIMEOUT_MS) {
+                DBG_LOG("⏰ Timeout do QR Code. Cancelando transação.");
+                exibirMensagem("  TEMPO    ESGOTADO", ST77XX_RED);
+
+                DBG_LOG("\u274c Tempo Esgotado. Cancelando cobrança no Mercado Pago...");
+                cancelarCobrancaMercadoPago(paymentId); // Invalida o QR Code no servidor
+                paymentId = "";
+                pixPayload = "";
+                exibirMensagem("  VENDA    CANCELADA", ST77XX_YELLOW);
+
+                delay(2000);
+                valorAcumulado = 0.00f;
+                estadoAtual = EM_ESPERA;
+                exibirTelaInicial();
+                break;
+            }
+            
+            if (currentTime % 500 < 250) {
+                digitalWrite(LED_PIN, HIGH);
+            } else {
+                digitalWrite(LED_PIN, LOW);
+            }
+            break;
+
+        // --- ESTADO: LIBERANDO PRODUTO (ACIONALMENTO MÚLTIPLO DO RELÉ AUTOMÁTICO SEM CRÉDITO) ---
+        case LIBERANDO_PRODUTO: { 
+            digitalWrite(LED_PIN, HIGH);
+
+            // 1. Calcula o número de CRÉDITOS baseado no VALOR REAL PAGO
+            int numCreditos = (configMaquina.valorProduto > 0) ? floor(valorPagoPix / configMaquina.valorProduto) : 0;
+            
+            DBG_LOG("------------------------------------------------------------------");
+            DBG_LOG("⚙️ Liberação Automática:");
+            DBG_LOG(" Valor Pago (Base para créditos): R$" + String(valorPagoPix, 2)); // ALTERADO
+            DBG_LOG(" Créditos a serem liberados: " + String(numCreditos)); // ALTERADO
+            DBG_LOG("------------------------------------------------------------------");
+            
+            if (numCreditos > 0) {
+                // 2. Acionamento Múltiplo do Relé
+                exibirMensagem(("LIBERANDO     " + String(numCreditos) + "      CREDITOS").c_str(), ST77XX_YELLOW); // ALTERADO
+                delay(1000); 
+
+                for (int i = 0; i < numCreditos; i++) {
+                    DBG_LOG("⚙️ Crédito " + String(i + 1) + " de " + String(numCreditos) + "..."); // ALTERADO
+                    digitalWrite(RELAY_PIN, LOW); // LIGA o relé (Ativo Baixo)
+                    delay(configMaquina.tempoReleMs);
+                    digitalWrite(RELAY_PIN, HIGH); // DESLIGA o RELE
+                    if (i < numCreditos - 1) {
+                        delay(configMaquina.tempoReleMs / 2); // Intervalo entre créditos
+                    }
+                }
+                DBG_LOG("⚙️ Relés Finalizados. Transação concluída.");
+                exibirTelaProdutoLiberado(); 
+            } else {
+                 DBG_LOG("⚠️ Zero créditos liberados. Verifique valor unitário."); // ALTERADO
+            }
+
+            // 3. Limpeza de variáveis de transação
+            valorAcumulado = 0.00f;
+            valorPagoPix = 0.00f;
+            paymentId = "";
+            pixPayload = "";
+            delay(3000);
+
+            // 4. Transição de estado: SEMPRE volta para EM_ESPERA
+            estadoAtual = EM_ESPERA;
+            exibirTelaInicial();
+            digitalWrite(LED_PIN, LOW);
+            break;
+        }
+
+        case MODO_AP_CONFIG:
+            // Já é tratado no início do loop
+            break;
+    }
+    delay(10);
+}
