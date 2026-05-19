@@ -8,8 +8,6 @@
  *                 impedindo pagamento após o cancelamento (evita produto não liberado).
  * Correção 6.0.6: Implementação de um timer no canto inferior direito do QrCode.
  * Correção 6.0.7: Realiza 3 tentativas de Conexão e vai automaticamente para o modo AP p/ Configurar.
- * Correção 6.0.8: Opção para Escanear as Redes Wi-Fi na tela de configuração.
- *                 Adicionado: Segure Boot por 5 segundos ao Ligar a placa para Resetar as Configurações
  */
 // --- BIBLIOTECAS ---
 #include <WiFi.h>
@@ -58,7 +56,7 @@ String redesDisponiveis = "";
 // --- PORTAS ---
 #define RELAY_PIN 13
 #define BUTTON_PIN 12
-#define RESET_PIN 0
+#define BOOT_PIN 0   // Botão BOOT da placa
 #define LED_PIN 2
 #define TFT_CS 5
 #define TFT_DC 17
@@ -474,10 +472,7 @@ void handleSave() {
         pass.toCharArray(configMaquina.wifiPassword, sizeof(configMaquina.wifiPassword));
         
         String token = server.arg("token");
-        // So atualiza o token se nao for o valor mascarado
-        if (token != "••••••••••••••••" && token.length() >= 10) {
-            token.toCharArray(configMaquina.mpAccessToken, sizeof(configMaquina.mpAccessToken));
-        }
+        token.toCharArray(configMaquina.mpAccessToken, sizeof(configMaquina.mpAccessToken));
 
         String posid = server.arg("posid");
         posid.toCharArray(configMaquina.mpExternalPosId, sizeof(configMaquina.mpExternalPosId));
@@ -607,7 +602,7 @@ void processarComandoSerial() {
         DBG_LOG("🔄 Reiniciando em 3 segundos...");
         delay(3000);
         ESP.restart();
-        return;
+        return; 
     }
     
     // COMANDO: INICIAR VENDA/GERAR PIX (Simula um clique)
@@ -873,7 +868,6 @@ void exibirTelaProdutoLiberado() {
 // ===================================
 
 void conectarWiFi() {
-    tentativas = 0;
     if (String(configMaquina.wifiSsid).length() == 0 || String(configMaquina.mpAccessToken).length() < 10) {
         DBG_LOG("❌ Configuração incompleta. Entrando no MODO CONFIG AP.");
         entrarModoConfigAP();
@@ -1086,7 +1080,7 @@ void setup() {
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, HIGH);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
-    pinMode(RESET_PIN, INPUT_PULLUP);
+    pinMode(BOOT_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
@@ -1105,62 +1099,50 @@ void setup() {
         unsigned long startTime = millis();
         exibirMensagem("CONFIGURAR   (5s)", ST77XX_YELLOW); 
 
-        while (digitalRead(BUTTON_PIN) == LOW && millis() - startTime < 5000) {  
-            int progress = map(millis() - startTime, 0, 5000, 0, 100);
-            tft.setCursor(10, 85);
-            tft.setTextColor(ST77XX_CYAN);
-            tft.print("Segure para Config   ");
-            tft.print(String(progress) + "%");
-            tft.print(" ");  
-            delay(50);
-        }
-
-        if (millis() - startTime >= 5000) {
-            carregarConfig(); 
-            entrarModoConfigAP();
-            return; 
-        } else {
-            exibirMensagem("INICIANDO!", ST77XX_WHITE);
-        }
-    }
-
-        // CHECAGEM DE BOTÃO BOOT NA INICIALIZAÇÃO (RESETAR APARELHO)
-    if (digitalRead(RESET_PIN) == LOW) {
-        unsigned long startTime = millis();
-        tft.setTextColor(ST77XX_YELLOW);
-        tft.setTextSize(2);
-        tft.setCursor(20, 30);
-        tft.print("ZERANDO");
-        tft.setCursor(32, 50);
-        tft.print("DADOS");
-        tft.setTextColor(ST77XX_CYAN);
-        tft.setCursor(5, 100);
-        tft.setTextSize(1);
-        tft.print(" SEGURE 10 SEGUNDOS");
-        tft.setCursor(5, 120);
-        tft.print("    PARA RESETAR");
-
-        while (digitalRead(RESET_PIN) == LOW && millis() - startTime < 10000) {  
-            int progress = map(millis() - startTime, 0, 10000, 0, 100);
-            tft.setCursor(10, 85);
-            tft.setTextColor(ST77XX_CYAN);
-            tft.print(" ");  
+        while (digitalRead(BUTTON_PIN) == LOW && millis() - startTime < 25000) {  
+            unsigned long el = millis() - startTime;
+            if (el < 5000) {
+                int progress = map(el, 0, 5000, 0, 100);
+                tft.setCursor(10, 85);
+                tft.setTextColor(ST77XX_CYAN);
+                tft.print("Config: ");
+                tft.print(String(progress) + "%  ");
+            } else {
+                int progress = map(el, 5000, 25000, 0, 100);
+                tft.fillScreen(ST77XX_RED);
+                tft.setCursor(5, 40);
+                tft.setTextColor(ST77XX_WHITE);
+                tft.setTextSize(2);
+                tft.println("SOLTE PARA");
+                tft.println("RESETAR!");
+                tft.setCursor(5, 100);
+                tft.setTextSize(1);
+                tft.print("Reset: ");
+                tft.print(String(progress) + "%");
+            }
             delay(50);
         }
         
-        if (millis() - startTime >= 10000) {
-
-        DBG_LOG("🚨 COMANDO MANUAL: ZERANDO TODAS as configurações.");
-        exibirMensagem(" ZERANDO   DADOS...", ST77XX_RED);
-        WiFi.disconnect(true);
-        if (SPIFFS.exists("/config.json")) {
-            SPIFFS.remove("/config.json");
-        }
-        DBG_LOG("🔄 Reiniciando em 3 segundos...");
-        delay(3000);
-        ESP.restart();
-        return;
-            
+        unsigned long elapsed = millis() - startTime;
+        if (elapsed >= 25000) {
+            // 25 segundos = RESET TOTAL
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 60);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("RESETANDO");
+            tft.println("TUDO...");
+            if (SPIFFS.exists("/config.json")) {
+                SPIFFS.remove("/config.json");
+            }
+            delay(2000);
+            ESP.restart();
+            return;
+        } else if (elapsed >= 5000) {
+            // 5 segundos = modo AP
+            carregarConfig(); 
+            entrarModoConfigAP();
+            return; 
         } else {
             exibirMensagem("INICIANDO!", ST77XX_WHITE);
         }
@@ -1180,7 +1162,51 @@ void loop() {
     }
     
     processarComandoSerial();
-    
+
+    // BOOT + BUTTON juntos por 3s = RESET TOTAL
+    static unsigned long btnHoldStart = 0;
+    static int ultimoPct = -1;
+    if (digitalRead(BUTTON_PIN) == LOW && digitalRead(BOOT_PIN) == LOW) {
+        if (btnHoldStart == 0) { btnHoldStart = millis(); ultimoPct = -1; }
+        unsigned long held = millis() - btnHoldStart;
+        int pct = min((int)map(held, 0, 3000, 0, 100), 100);
+        if (pct != ultimoPct) {
+            ultimoPct = pct;
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 40);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("SOLTE PARA");
+            tft.println("RESETAR!");
+            tft.setCursor(5, 100);
+            tft.setTextSize(1);
+            tft.print("Reset: ");
+            tft.print(String(pct) + "%");
+        }
+        if (held >= 3000) {
+            tft.fillScreen(ST77XX_RED);
+            tft.setCursor(5, 60);
+            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextSize(2);
+            tft.println("RESETANDO");
+            tft.println("TUDO...");
+            delay(2000);
+            if (SPIFFS.exists("/config.json")) SPIFFS.remove("/config.json");
+            ESP.restart();
+        }
+    } else {
+        if (btnHoldStart != 0) {
+            btnHoldStart = 0;
+            if (estadoAtual == EM_ESPERA) exibirTelaInicial();
+        }
+    }
+
+    // Se BOOT pressionado, bloqueia qualquer ação
+    if (digitalRead(BOOT_PIN) == LOW) {
+        delay(10);
+        return;
+    }
+
     static unsigned long lastCheckTime = 0;
     const long checkInterval = 5000;
     unsigned long currentTime = millis();
